@@ -1003,6 +1003,358 @@ fn build_land_record(
     buf
 }
 
+// --- navmesh (NAVM/NAVI) ---
+//
+// Every generated cell gets one NAVM record covering the full cell
+// footprint, stitched to its north/east/south/west neighbors (whichever
+// exist) via NVEX cross-cell connections — see `stitch_cell_navmeshes` and
+// `build_navm_record`. Local NVTR adjacency across a cell's own outer
+// boundary stays -1 either way (NVEX is a separate, supplemental list, not a
+// special adjacency encoding); only a cell with zero navmeshed neighbors
+// (e.g. a 1-cell worldspace) ends up fully self-contained (n_ext_conns=0).
+//
+// This isn't just for seamless NPC pathing across cell borders — it's load
+// bearing: GECK reliably crashes past ~130 fully self-contained (unconnected)
+// navmeshes in one worldspace (confirmed by bisection), and real
+// GECK-authored exterior content is almost always NVEX-connected (96.6% of
+// navmeshes in FalloutNV.esm's main worldspace are), so isolated navmeshes
+// at any real scale are pathological, not the norm.
+
+/// Vertices per side of the coarse navmesh grid (33×33 VHGT heights
+/// subsampled every 4th vertex).
+const NAV_VERTS: usize = 9;
+/// Stride into the 33×33 `heights` grid between adjacent nav vertices.
+const NAV_STEP: usize = 4;
+/// Quads per side (8×8 = 64 quads, 2 tris/quad = 128 tris/cell).
+const NAV_QUADS: usize = NAV_VERTS - 1;
+const NAV_TRIS_PER_CELL: usize = NAV_QUADS * NAV_QUADS * 2; // 128
+const NAV_VERTS_PER_CELL: usize = NAV_VERTS * NAV_VERTS; // 81
+
+const NAVM_NVER_VERSION: u32 = 11;
+/// "Finalized" triangle flag — required or GECK reports navmesh errors.
+const NAVM_TRI_FLAGS: u32 = 0x0000_0800;
+/// NVGD spatial-grid divisor. Matches the divisor real GECK-generated
+/// navmeshes use for meshes with 100-200 triangles (our fixed 128 tris/cell
+/// falls in that range) — confirmed by decoding FalloutNV.esm. divisor=1 is
+/// never used above ~100 triangles in vanilla data and reliably crashes GECK.
+const NAVM_GRID_DIVISOR: u32 = 4;
+/// FormID of the base game's single global NAVI record (confirmed by
+/// decoding FalloutNV.esm — it lists all 4,771 navmeshes in the whole game).
+/// A plugin adding navmeshes must override this exact record, not create a
+/// new one: an earlier version of this generator allocated a fresh FormID
+/// for its own NAVI record instead, which GECK was never built to expect —
+/// almost certainly the real cause of a ~128-navmesh GECK crash that
+/// survived several other unrelated fixes (NVGD divisor, NVEX stitching,
+/// multi-record chunking) untouched.
+const GLOBAL_NAVI_FID: u32 = 0x00014B92;
+
+/// One coarse navmesh triangle: 3 vertex indices (CCW viewed from above) plus
+/// 3 adjacency slots (plain triangle index, or -1 for a boundary edge).
+struct NavTri {
+    v: [i16; 3],
+    /// a0 = neighbor across edge v1→v0, a1 across v2→v1, a2 across v0→v2.
+    adj: [i16; 3],
+}
+
+/// Local triangle index of T_A(i,j) — the SW/SE/NE half of quad (i,j).
+fn nav_tri_a(i: usize, j: usize) -> i16 {
+    (i * NAV_QUADS + j) as i16 * 2
+}
+/// Local triangle index of T_B(i,j) — the SW/NE/NW half of quad (i,j).
+fn nav_tri_b(i: usize, j: usize) -> i16 {
+    (i * NAV_QUADS + j) as i16 * 2 + 1
+}
+
+/// Build the coarse 9×9-vertex / 128-triangle navmesh geometry for one cell
+/// by subsampling the 33×33 `heights` grid already computed by
+/// `sample_heights` for this cell (does NOT resample `ground.level()`).
+///
+/// Local adjacency across the outer 8×8 quad-grid boundary is always -1;
+/// cross-cell connectivity is added afterwards as NVEX entries (see
+/// `stitch_cell_navmeshes`), once every cell's geometry is known.
+fn build_cell_navmesh(
+    heights: &[[i32; VERTS]; VERTS],
+    cell_x: i32,
+    cell_y: i32,
+) -> (Vec<(f32, f32, f32)>, Vec<NavTri>) {
+    let mut verts = Vec::with_capacity(NAV_VERTS_PER_CELL);
+    for r9 in 0..NAV_VERTS {
+        for c9 in 0..NAV_VERTS {
+            let row = r9 * NAV_STEP;
+            let col = c9 * NAV_STEP;
+            let x = cell_x as f32 * CELL_GAME_UNITS + col as f32 * 128.0;
+            let y = cell_y as f32 * CELL_GAME_UNITS + row as f32 * 128.0;
+            let z = heights[row][col] as f32 * 8.0;
+            verts.push((x, y, z));
+        }
+    }
+
+    let vidx = |r9: usize, c9: usize| -> i16 { (r9 * NAV_VERTS + c9) as i16 };
+
+    let mut tris = Vec::with_capacity(NAV_TRIS_PER_CELL);
+    for i in 0..NAV_QUADS {
+        for j in 0..NAV_QUADS {
+            // T_A = SW, SE, NE (CCW)
+            let a0 = if i > 0 { nav_tri_b(i - 1, j) } else { -1 };
+            let a1 = if j + 1 < NAV_QUADS {
+                nav_tri_b(i, j + 1)
+            } else {
+                -1
+            };
+            let a2 = nav_tri_b(i, j);
+            tris.push(NavTri {
+                v: [vidx(i, j), vidx(i, j + 1), vidx(i + 1, j + 1)],
+                adj: [a0, a1, a2],
+            });
+
+            // T_B = SW, NE, NW (CCW)
+            let b0 = nav_tri_a(i, j);
+            let b1 = if i + 1 < NAV_QUADS {
+                nav_tri_a(i + 1, j)
+            } else {
+                -1
+            };
+            let b2 = if j > 0 { nav_tri_a(i, j - 1) } else { -1 };
+            tris.push(NavTri {
+                v: [vidx(i, j), vidx(i + 1, j + 1), vidx(i + 1, j)],
+                adj: [b0, b1, b2],
+            });
+        }
+    }
+    (verts, tris)
+}
+
+/// Compute the vertex-average centroid of a navmesh, for the NAVI NVMI entry.
+fn navmesh_centroid(verts: &[(f32, f32, f32)]) -> (f32, f32, f32) {
+    let (mut sx, mut sy, mut sz) = (0.0f32, 0.0f32, 0.0f32);
+    for &(x, y, z) in verts {
+        sx += x;
+        sy += y;
+        sz += z;
+    }
+    let n = verts.len() as f32;
+    (sx / n, sy / n, sz / n)
+}
+
+/// Compute reciprocal NVEX (local_tri, neighbor_navm_fid, remote_tri) entries
+/// stitching every cell's navmesh to its north and east neighbors (if
+/// present). South/west connections are covered when the neighbor on that
+/// side is itself processed as "this cell's north/east neighbor", so each
+/// shared boundary is only computed once.
+///
+/// This relies on every cell using the identical coarse grid layout (same
+/// NAV_QUADS resolution, same world-space vertex spacing) so boundary
+/// triangles correspond exactly 1:1 across a shared edge — no tessellation
+/// mismatch to resolve, unlike the general case.
+fn stitch_cell_navmeshes(
+    cell_coords: &[(i32, i32)],
+    navm_fids: &[u32],
+) -> Vec<Vec<(u32, u32, u16)>> {
+    let coord_to_idx: BTreeMap<(i32, i32), usize> = cell_coords
+        .iter()
+        .enumerate()
+        .map(|(idx, &c)| (c, idx))
+        .collect();
+
+    let mut nvex: Vec<Vec<(u32, u32, u16)>> = vec![Vec::new(); cell_coords.len()];
+
+    for (idx, &(cx, cy)) in cell_coords.iter().enumerate() {
+        // North neighbor: this cell's north edge meets the neighbor's south edge.
+        if let Some(&n_idx) = coord_to_idx.get(&(cx, cy + 1)) {
+            for j in 0..NAV_QUADS {
+                let local_tri = nav_tri_b(NAV_QUADS - 1, j);
+                let remote_tri = nav_tri_a(0, j);
+                nvex[idx].push((local_tri as u32, navm_fids[n_idx], remote_tri as u16));
+                nvex[n_idx].push((remote_tri as u32, navm_fids[idx], local_tri as u16));
+            }
+        }
+        // East neighbor: this cell's east edge meets the neighbor's west edge.
+        if let Some(&e_idx) = coord_to_idx.get(&(cx + 1, cy)) {
+            for i in 0..NAV_QUADS {
+                let local_tri = nav_tri_a(i, NAV_QUADS - 1);
+                let remote_tri = nav_tri_b(i, 0);
+                nvex[idx].push((local_tri as u32, navm_fids[e_idx], remote_tri as u16));
+                nvex[e_idx].push((remote_tri as u32, navm_fids[idx], local_tri as u16));
+            }
+        }
+    }
+    nvex
+}
+
+/// Build a NAVM record for one cell, stitched to its neighbors via `nvex`
+/// (empty for a cell with no navmeshed neighbors, e.g. a 1-cell worldspace).
+///
+/// Real GECK-authored exterior content almost always has cross-cell NVEX
+/// connections (96.6% of navmeshes in FalloutNV.esm's main worldspace do) —
+/// GECK itself appears to choke on more than ~130 fully self-contained
+/// (unconnected) navmeshes in one worldspace, confirmed by bisection during
+/// development. Isolated per-cell navmeshes without NVEX are the pathological
+/// case that triggers that, not the norm.
+fn build_navm_record(
+    form_id: u32,
+    cell_fid: u32,
+    verts: &[(f32, f32, f32)],
+    tris: &[NavTri],
+    nvex: &[(u32, u32, u16)],
+) -> Vec<u8> {
+    let n_verts = verts.len() as u32;
+    let n_tris = tris.len() as u32;
+
+    let mut data = Vec::new();
+
+    let mut nver = Vec::new();
+    pu32(&mut nver, NAVM_NVER_VERSION);
+    data.extend(subrecord(b"NVER", &nver));
+
+    let mut navm_data = Vec::new();
+    pu32(&mut navm_data, cell_fid);
+    pu32(&mut navm_data, n_verts);
+    pu32(&mut navm_data, n_tris);
+    pu32(&mut navm_data, nvex.len() as u32); // n_ext_conns
+    pu32(&mut navm_data, 0); // n_portals
+    pu32(&mut navm_data, 0); // unused
+    data.extend(subrecord(b"DATA", &navm_data));
+
+    let mut nvvx = Vec::with_capacity(verts.len() * 12);
+    let (mut min_x, mut min_y, mut min_z) = (f32::MAX, f32::MAX, f32::MAX);
+    let (mut max_x, mut max_y, mut max_z) = (f32::MIN, f32::MIN, f32::MIN);
+    for &(x, y, z) in verts {
+        pf32(&mut nvvx, x);
+        pf32(&mut nvvx, y);
+        pf32(&mut nvvx, z);
+        min_x = min_x.min(x);
+        min_y = min_y.min(y);
+        min_z = min_z.min(z);
+        max_x = max_x.max(x);
+        max_y = max_y.max(y);
+        max_z = max_z.max(z);
+    }
+    data.extend(subrecord(b"NVVX", &nvvx));
+
+    let mut nvtr = Vec::with_capacity(tris.len() * 16);
+    for t in tris {
+        pi16(&mut nvtr, t.v[0]);
+        pi16(&mut nvtr, t.v[1]);
+        pi16(&mut nvtr, t.v[2]);
+        pi16(&mut nvtr, t.adj[0]);
+        pi16(&mut nvtr, t.adj[1]);
+        pi16(&mut nvtr, t.adj[2]);
+        pu32(&mut nvtr, NAVM_TRI_FLAGS);
+    }
+    data.extend(subrecord(b"NVTR", &nvtr));
+
+    // NVGD: spatial acceleration grid. divisor=NAVM_GRID_DIVISOR matches the
+    // divisor real GECK-generated navmeshes use for meshes in our triangle
+    // count range (empirically confirmed against FalloutNV.esm: 100-200 tri
+    // meshes use divisor 4 or 5 — divisor=1 is never used above ~100 tris and
+    // reliably crashes GECK when forced, per a hard crash reproduced during
+    // development).
+    let cell_w = (max_x - min_x) / NAVM_GRID_DIVISOR as f32;
+    let cell_h = (max_y - min_y) / NAVM_GRID_DIVISOR as f32;
+
+    // Precompute each triangle's 2D (x,y) AABB for the grid-cell overlap test.
+    let tri_aabbs: Vec<(f32, f32, f32, f32)> = tris
+        .iter()
+        .map(|t| {
+            let p = [verts[t.v[0] as usize], verts[t.v[1] as usize], verts[t.v[2] as usize]];
+            let txmin = p[0].0.min(p[1].0).min(p[2].0);
+            let txmax = p[0].0.max(p[1].0).max(p[2].0);
+            let tymin = p[0].1.min(p[1].1).min(p[2].1);
+            let tymax = p[0].1.max(p[1].1).max(p[2].1);
+            (txmin, txmax, tymin, tymax)
+        })
+        .collect();
+
+    let mut nvgd = Vec::new();
+    pu32(&mut nvgd, NAVM_GRID_DIVISOR); // divisor
+    pf32(&mut nvgd, cell_w);
+    pf32(&mut nvgd, cell_h);
+    pf32(&mut nvgd, min_x);
+    pf32(&mut nvgd, min_y);
+    pf32(&mut nvgd, min_z);
+    pf32(&mut nvgd, max_x);
+    pf32(&mut nvgd, max_y);
+    pf32(&mut nvgd, max_z);
+    for gy in 0..NAVM_GRID_DIVISOR {
+        for gx in 0..NAVM_GRID_DIVISOR {
+            let cxmin = min_x + gx as f32 * cell_w;
+            let cxmax = cxmin + cell_w;
+            let cymin = min_y + gy as f32 * cell_h;
+            let cymax = cymin + cell_h;
+            let indices: Vec<u16> = tri_aabbs
+                .iter()
+                .enumerate()
+                .filter(|(_, &(txmin, txmax, tymin, tymax))| {
+                    txmin <= cxmax && txmax >= cxmin && tymin <= cymax && tymax >= cymin
+                })
+                .map(|(i, _)| i as u16)
+                .collect();
+            pu16(&mut nvgd, indices.len() as u16);
+            for idx in indices {
+                pu16(&mut nvgd, idx);
+            }
+        }
+    }
+    data.extend(subrecord(b"NVGD", &nvgd));
+
+    // NVEX: cross-cell external connections, present only when nvex is
+    // non-empty (a cell with no navmeshed neighbor, e.g. a 1-cell
+    // worldspace, stays fully self-contained per Phase 1 behavior).
+    if !nvex.is_empty() {
+        let mut nvex_data = Vec::with_capacity(nvex.len() * 10);
+        for &(local_tri, neighbor_navm_fid, remote_tri) in nvex {
+            pu32(&mut nvex_data, local_tri);
+            pu32(&mut nvex_data, neighbor_navm_fid);
+            pu16(&mut nvex_data, remote_tri);
+        }
+        data.extend(subrecord(b"NVEX", &nvex_data));
+    }
+
+    let mut buf = Vec::new();
+    push_record(&mut buf, b"NAVM", 0, form_id, &data);
+    buf
+}
+
+/// Build the single plugin-wide NAVI record. `entries` = one (navm_fid,
+/// cell_fid, centroid) per NAVM, in the same order used for both the NVMI
+/// and NVCI blocks (NVMI block fully first, then NVCI block — not
+/// interleaved, matching CLAUDE.md's documented subrecord order).
+/// `entries` = one (navm_fid, centroid) per NAVM. The NVMI compact format's
+/// 3rd field is the *worldspace's* FormID, not each navmesh's owning cell —
+/// confirmed against real FalloutNV.esm data (100% of ~3,000 sampled entries
+/// match the owning WRLD's fid, 0% match the owning CELL's fid), correcting
+/// an earlier misreading of this field as `cell_fid`.
+fn build_navi_record(form_id: u32, wrld_fid: u32, entries: &[(u32, (f32, f32, f32))]) -> Vec<u8> {
+    let mut data = Vec::new();
+
+    let mut nver = Vec::new();
+    pu32(&mut nver, NAVM_NVER_VERSION);
+    data.extend(subrecord(b"NVER", &nver));
+
+    for &(navm_fid, (cx, cy, cz)) in entries {
+        let mut nvmi = Vec::with_capacity(32);
+        pu32(&mut nvmi, 0); // flags = 0 (compact format — matches GECK's own output)
+        pu32(&mut nvmi, navm_fid);
+        pu32(&mut nvmi, wrld_fid);
+        pu32(&mut nvmi, 0); // pad
+        pf32(&mut nvmi, cx);
+        pf32(&mut nvmi, cy);
+        pf32(&mut nvmi, cz);
+        pu32(&mut nvmi, 0); // unk
+        data.extend(subrecord(b"NVMI", &nvmi));
+    }
+    for &(navm_fid, _) in entries {
+        let mut nvci = Vec::with_capacity(16);
+        pu32(&mut nvci, navm_fid);
+        nvci.extend_from_slice(&[0u8; 12]);
+        data.extend(subrecord(b"NVCI", &nvci));
+    }
+
+    let mut buf = Vec::new();
+    push_record(&mut buf, b"NAVI", 0, form_id, &data);
+    buf
+}
+
 // --- vegetation helpers ---
 
 /// Build a single REFR record for a static object placed in the world.
@@ -1920,6 +2272,10 @@ pub fn generate_fnv_esm(
         cell_y: i32,
         cell_fid: u32,
         land_fid: u32,
+        navm_fid: u32,
+        navm_verts: Vec<(f32, f32, f32)>,
+        navm_tris: Vec<NavTri>,
+        navm_centroid: (f32, f32, f32),
         vhgt_offset: f32,
         deltas: Vec<i8>,
         vnml: Vec<u8>,
@@ -1943,6 +2299,11 @@ pub fn generate_fnv_esm(
     let coc_fid = next_fid;
     next_fid += 1;
 
+    // The NAVI record overrides the base game's fixed global FormID
+    // (GLOBAL_NAVI_FID) rather than allocating a new one — see that
+    // constant's comment. No FormID reservation needed here since it's a
+    // pre-existing FormID, not a new allocation.
+
     let mut cells: Vec<CellInfo> = Vec::with_capacity(num_cols * num_rows);
     if terrain_only {
         println!("  Skipping object placement (terrain only)");
@@ -1957,7 +2318,8 @@ pub fn generate_fnv_esm(
             let cell_y = (num_rows - 1 - row) as i32 - y_offset;
             let cell_fid = next_fid;
             let land_fid = next_fid + 1;
-            next_fid += 2;
+            let navm_fid = next_fid + 2;
+            next_fid += 3;
 
             let heights =
                 sample_heights(ground, col as i32, row as i32, global_min, effective_scale);
@@ -1971,6 +2333,9 @@ pub fn generate_fnv_esm(
                 default_texture,
                 road_grid.as_ref(),
             );
+
+            let (navm_verts, navm_tris) = build_cell_navmesh(&heights, cell_x, cell_y);
+            let navm_centroid = navmesh_centroid(&navm_verts);
 
             let (
                 house_refs,
@@ -2108,6 +2473,10 @@ pub fn generate_fnv_esm(
                 cell_y,
                 cell_fid,
                 land_fid,
+                navm_fid,
+                navm_verts,
+                navm_tris,
+                navm_centroid,
                 vhgt_offset,
                 deltas,
                 vnml,
@@ -2129,6 +2498,23 @@ pub fn generate_fnv_esm(
         }
     }
     println!("Done!");
+
+    // Stitch every cell's navmesh to its north/east neighbors (south/west are
+    // covered from the other side) via NVEX, now that every cell's geometry
+    // and navm_fid is known. Real GECK-authored exterior content is almost
+    // always connected this way; shipping fully isolated per-cell navmeshes
+    // reliably crashes GECK past ~130 cells in one worldspace (see the
+    // comment on `build_navm_record`).
+    let cell_coords: Vec<(i32, i32)> = cells.iter().map(|c| (c.cell_x, c.cell_y)).collect();
+    let navm_fids: Vec<u32> = cells.iter().map(|c| c.navm_fid).collect();
+    let nvex_by_cell = stitch_cell_navmeshes(&cell_coords, &navm_fids);
+    let navm_recs: Vec<Vec<u8>> = cells
+        .iter()
+        .zip(nvex_by_cell.iter())
+        .map(|(c, nvex)| {
+            build_navm_record(c.navm_fid, c.cell_fid, &c.navm_verts, &c.navm_tris, nvex)
+        })
+        .collect();
 
     // Group cells into exterior blocks (div_euclid 8) and subblocks (div_euclid 2).
 
@@ -2208,6 +2594,9 @@ pub fn generate_fnv_esm(
                     ));
                 }
 
+                // Per-cell navmesh, stitched to its neighbors via NVEX.
+                temp_children_content.extend_from_slice(&navm_recs[idx]);
+
                 let mut tmp_grup = Vec::new();
                 push_grup(&mut tmp_grup, cell_label, 9, &temp_children_content);
 
@@ -2259,6 +2648,18 @@ pub fn generate_fnv_esm(
     let mut wrld_grup = Vec::new();
     push_grup(&mut wrld_grup, *b"WRLD", 0, &wrld_grup_content);
 
+    // Single NAVI record overriding GLOBAL_NAVI_FID, referencing every
+    // navmeshed cell's NAVM. Its top-level GRUP must precede the WRLD GRUP
+    // (generalizing CLAUDE.md's documented interior-cell rule that NAVI must
+    // precede CELL) or GECK reports navmesh errors on load/save.
+    let navi_entries: Vec<(u32, (f32, f32, f32))> = cells
+        .iter()
+        .map(|c| (c.navm_fid, c.navm_centroid))
+        .collect();
+    let navi_rec = build_navi_record(GLOBAL_NAVI_FID, TESTESM_WRLD_FID, &navi_entries);
+    let mut navi_grups = Vec::new();
+    push_grup(&mut navi_grups, *b"NAVI", 0, &navi_rec);
+
     // Clone testesm's TES4 record verbatim, then patch the two fields that
     // reflect our content size.
     let mut tes4 = SAMPLEESM_BYTES[..SAMPLEESM_TES4_LEN].to_vec();
@@ -2275,7 +2676,10 @@ pub fn generate_fnv_esm(
         })
         .sum::<u32>()
         + 1; // +1 for COC marker in cell (0,0)
-    let num_records = 1u32 + cells.len() as u32 * 2 + total_refrs; // WRLD + CELL + LAND + REFRs
+    let num_records = 1u32 // WRLD
+        + 1u32 // NAVI
+        + cells.len() as u32 * 3 // CELL + LAND + NAVM
+        + total_refrs;
     tes4[TES4_NUM_RECORDS_OFFSET..TES4_NUM_RECORDS_OFFSET + 4]
         .copy_from_slice(&num_records.to_le_bytes());
 
@@ -2286,6 +2690,7 @@ pub fn generate_fnv_esm(
 
     let mut file_bytes = Vec::new();
     file_bytes.extend_from_slice(&tes4);
+    file_bytes.extend_from_slice(&navi_grups);
     file_bytes.extend_from_slice(&wrld_grup);
 
     let resolved_dir = if output_dir.is_dir() && is_dir_writeable(output_dir) {
