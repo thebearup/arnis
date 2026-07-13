@@ -3,7 +3,7 @@
 Arnis Support for Fallout: New Vegas
 ------------------------------------
 Arnis is a compelling tool that generates maps for Minecraft using geo-spatial data from the real world.
-With this fork, Arnis can output maps in .esm format, compatible with Fallout: NEw Vegas (and, presumably, Fallout 3).
+With this fork, Arnis can output maps in .esm format, compatible with Fallout: New Vegas (and, presumably, Fallout 3).
 
 Note: This is a very early prototype with limited support for the following:
 - Elevation
