@@ -16,6 +16,7 @@ mod elevation_data;
 mod floodfill;
 mod floodfill_cache;
 mod fnv_esm;
+mod fnv_lod;
 mod ground;
 mod ground_generation;
 mod land_cover;

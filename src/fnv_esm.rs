@@ -26,7 +26,7 @@ pub(crate) fn fnv_road_type(highway: &str) -> u8 {
 
 const BLOCKS_PER_CELL: i32 = 32;
 const VERTS: usize = 33;
-const HEIGHT_MARGIN: i32 = 16;
+pub(crate) const HEIGHT_MARGIN: i32 = 16;
 const FNV_FORM_VERSION: u16 = 15;
 pub const DEFAULT_OUTPUT_DIR: &str =
     "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Fallout New Vegas\\Data";
@@ -77,7 +77,7 @@ const SMOOTH_FULL: i32 = 32;
 /// without over-flattening moderate slopes.
 const SMOOTH_MAX_BLEND: f32 = 0.65;
 /// Each FNV exterior cell spans 4096 game units in X and Y.
-const CELL_GAME_UNITS: f32 = 4096.0;
+pub(crate) const CELL_GAME_UNITS: f32 = 4096.0;
 /// Multiplier applied to terrain height variation for more dramatic FNV terrain.
 /// Minecraft Y blocks (1m each) map to VHGT units (8 game units ≈ 11 cm each),
 /// so raw values need scaling to produce visible elevation changes in-game.
@@ -863,8 +863,13 @@ fn build_wrld_record(
     pf32(&mut onam, 0.0_f32);
     data.extend(subrecord(b"ONAM", &onam));
 
-    // DATA: 0x01 = Small World flag
-    data.extend(subrecord(b"DATA", &[0x01u8]));
+    // DATA: worldspace flags. Real WastelandNV (which has genuine terrain LOD
+    // streaming) has this clear; Small World (0x01) is only set on tiny test
+    // maps and small bounded child worldspaces (Freeside, Gamorrah, etc.) that
+    // don't get their own LOD. Setting it here was disabling LOD for our
+    // generated worldspaces and is suspected to cause the load hang on large
+    // ones (confirmed empirically against FalloutNV.esm's real WRLD records).
+    data.extend(subrecord(b"DATA", &[0x00u8]));
 
     // NAM0 / NAM9: world bounds in game units (SW corner, NE corner).
     let mut nam0 = Vec::new();
@@ -2712,6 +2717,63 @@ pub fn generate_fnv_esm(
         "{} FNV worldspace ESM saved to: {}",
         "Done!".green().bold(),
         out_path.display()
+    );
+
+    println!("  Generating terrain LOD (level4/8/16/32)...");
+    // The LOD folder identity is keyed only by the worldspace editorID
+    // string (see generate_lod_assets), not by FormID, and this generator
+    // always uses the same fixed EDID ("ArnisWorldspace"). Successive runs
+    // with a different bbox/shape produce a different tile grid (different
+    // X/Y filenames), so stale tiles from an earlier run can linger alongside
+    // the new ones — two overlapping, conflicting tile sets for the same
+    // cell range. Confirmed firsthand: this exact contamination (leftover
+    // zero-aligned tiles coexisting with newly min-anchored ones) reproduced
+    // an in-game loading-screen hang. We only warn here rather than deleting
+    // anything ourselves — this output directory may contain files the user
+    // is managing by hand, and silently removing them is not this tool's
+    // call to make. Callers that want a guaranteed-clean directory (e.g.
+    // run.cmd) should purge it themselves before invoking this generator.
+    let edid_lower = "arnisworldspace";
+    for rel in [
+        format!("meshes/landscape/lod/{}", edid_lower),
+        format!("textures/landscape/lod/{}", edid_lower),
+    ] {
+        let dir = resolved_dir.join(rel.replace('/', std::path::MAIN_SEPARATOR_STR));
+        if dir.is_dir() && fs::read_dir(&dir).map(|mut d| d.next().is_some()).unwrap_or(false) {
+            println!(
+                "  {} Existing LOD files found in {:?} — recommend clearing this folder before proceeding (stale tiles from a differently-shaped worldspace can conflict with the new ones and cause loading issues in-game).",
+                "Warning:".yellow().bold(),
+                dir
+            );
+        }
+    }
+
+    let lod_assets = crate::fnv_lod::generate_lod_assets(
+        ground,
+        "ArnisWorldspace",
+        min_cell_x,
+        max_cell_x,
+        min_cell_y,
+        max_cell_y,
+        x_offset,
+        y_offset,
+        num_rows as i32,
+        global_min,
+        effective_scale,
+    );
+    for (relative_path, bytes) in &lod_assets {
+        let path = resolved_dir.join(relative_path.replace('/', std::path::MAIN_SEPARATOR_STR));
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("Failed to create LOD output directory: {}", e))?;
+        }
+        fs::write(&path, bytes).map_err(|e| format!("Failed to write LOD file {:?}: {}", path, e))?;
+    }
+    println!(
+        "{} {} terrain LOD files saved under: {}",
+        "Done!".green().bold(),
+        lod_assets.len(),
+        resolved_dir.display()
     );
 
     Ok(())
