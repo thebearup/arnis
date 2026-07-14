@@ -551,17 +551,23 @@ function updateFormatToggleUI(format) {
     if (chooseWorldLabel) {
       chooseWorldLabel.textContent = window.localization?.choose_world || 'Create World';
     }
-    javaBtn.classList.add('format-active');
-    bedrockBtn.classList.remove('format-active');
-  } else {
-    javaBtn.classList.remove('format-active');
-    bedrockBtn.classList.add('format-active');
+  } else if (format === 'bedrock') {
     // Clear world path for bedrock (auto-generated)
     worldPath = "";
     if (selectedWorldText) {
       const bedrockText = window.localization?.bedrock_auto_generated || 'Bedrock world is auto-generated';
       selectedWorldText.textContent = bedrockText;
       selectedWorldText.style.color = '#fecc44';
+    }
+  } else if (format === 'fnv') {
+    // FNV picks an output folder via a dialog (see createWorld()) rather
+    // than auto-generating or using the Java world-save flow — clear any
+    // previous selection so the user has to pick a folder for this format.
+    worldPath = "";
+    if (chooseWorldBtn) {
+      chooseWorldBtn.disabled = false;
+      chooseWorldBtn.style.opacity = '1';
+      chooseWorldBtn.style.cursor = 'pointer';
     }
   }
 }
