@@ -122,6 +122,7 @@ pub fn generate_lod_assets(
     num_rows: i32,
     global_min: i32,
     effective_scale: i32,
+    effective_water_level: Option<f32>,
 ) -> Vec<(String, Vec<u8>)> {
     let mut out = Vec::new();
     let edid_lower = worldspace_edid.to_lowercase();
@@ -145,6 +146,13 @@ pub fn generate_lod_assets(
                     ground, ax_min, ax_max, az_min, az_max,
                     x_offset, y_offset, num_rows, global_min, effective_scale, valid_range,
                 );
+                let water = effective_water_level.and_then(|water_level| {
+                    build_water_geometry(
+                        ground, ax_min, ax_max, az_min, az_max,
+                        x_offset, y_offset, num_rows, global_min, effective_scale, valid_range,
+                        water_level,
+                    )
+                });
                 // ".N." (capital), matching the real reference tile's embedded
                 // texture path exactly (a real, if likely harmless given
                 // Windows' case-insensitive filesystem, discrepancy).
@@ -160,7 +168,8 @@ pub fn generate_lod_assets(
                     tx as f32 * crate::fnv_esm::CELL_GAME_UNITS,
                     ty as f32 * crate::fnv_esm::CELL_GAME_UNITS,
                 );
-                let nif = build_lod_nif(&verts, &tris, &diffuse_path, &normal_path, tile_origin);
+                let water_ref = water.as_ref().map(|(wv, wt)| (wv.as_slice(), wt.as_slice()));
+                let nif = build_lod_nif(&verts, &tris, &diffuse_path, &normal_path, tile_origin, water_ref);
                 out.push((
                     format!(
                         "meshes/landscape/lod/{}/{}.level{}.x{}.y{}.nif",
@@ -450,6 +459,102 @@ fn build_tile_geometry(
     (verts, tris)
 }
 
+/// Build this tile's water plane, if any part of it dips below
+/// `water_level` (game units, same convention as `sample_height_game_z`).
+/// Returns `None` when the tile has no water at all — matching real
+/// reference tiles, which omit the `BSSegmentedTriShape` blocks entirely in
+/// that case rather than writing a degenerate one.
+///
+/// Shaped to the actual underwater portion of the tile rather than a crude
+/// full-tile-or-nothing flag: confirmed against 15+ real reference tiles,
+/// whose water shapes range from a full 25-vertex/32-triangle tile down to
+/// an 8-vertex corner, tracking the real coastline. Reuses the exact same
+/// sampling grid as `build_tile_geometry` (same `n`, same per-point
+/// `(ax,az) -> (game_x,game_y)` mapping) so the two shapes align
+/// positionally, though water needs no skirt. Returns absolute world-space
+/// vertices/triangles, matching `build_tile_geometry`'s contract.
+///
+/// A quad is included only when all 4 corners are at/below `water_level`
+/// (fully submerged) — a conservative choice avoiding water visibly poking
+/// above land at partially-submerged quad boundaries. Real xLODGen's own
+/// inclusion rule isn't independently confirmed; this is a reasonable
+/// starting point, easy to refine later if the waterline sits noticeably
+/// short of the real coastline.
+#[allow(clippy::too_many_arguments)]
+fn build_water_geometry(
+    ground: &Ground,
+    ax_min: i32,
+    ax_max: i32,
+    az_min: i32,
+    az_max: i32,
+    x_offset: i32,
+    y_offset: i32,
+    num_rows: i32,
+    global_min: i32,
+    effective_scale: i32,
+    valid_range: (i32, i32, i32, i32),
+    water_level: f32,
+) -> Option<(Vec<LodVertex>, Vec<LodTriangle>)> {
+    let (valid_ax_min, valid_ax_max, valid_az_min, valid_az_max) = valid_range;
+    let n = LOD_TILE_QUADS;
+
+    // Precompute each grid point's absolute (x,y) and terrain height once.
+    let mut xy = vec![(0.0f32, 0.0f32); (n + 1) * (n + 1)];
+    let mut terrain_z = vec![0.0f32; (n + 1) * (n + 1)];
+    for r in 0..=n {
+        let az = az_min + (az_max - az_min) * r as i32 / n as i32;
+        for c in 0..=n {
+            let ax = ax_min + (ax_max - ax_min) * c as i32 / n as i32;
+            let game_x = ax as f32 * 128.0 - x_offset as f32 * crate::fnv_esm::CELL_GAME_UNITS;
+            let game_y = (num_rows - y_offset) as f32 * crate::fnv_esm::CELL_GAME_UNITS
+                - az as f32 * 128.0;
+            let sample_ax = ax.clamp(valid_ax_min, valid_ax_max);
+            let sample_az = az.clamp(valid_az_min, valid_az_max);
+            let game_z = sample_height_game_z(ground, sample_ax, sample_az, global_min, effective_scale);
+            xy[r * (n + 1) + c] = (game_x, game_y);
+            terrain_z[r * (n + 1) + c] = game_z;
+        }
+    }
+    let underwater = |r: usize, c: usize| terrain_z[r * (n + 1) + c] <= water_level;
+
+    // Compact vertex list: only grid points actually used by an included
+    // quad get emitted, matching real tiles' compact (non-full-grid) counts.
+    let mut vert_index: std::collections::HashMap<(usize, usize), u16> = std::collections::HashMap::new();
+    let mut verts: Vec<LodVertex> = Vec::new();
+    let mut get_vert = |r: usize, c: usize| -> u16 {
+        if let Some(&idx) = vert_index.get(&(r, c)) {
+            return idx;
+        }
+        let (gx, gy) = xy[r * (n + 1) + c];
+        let idx = verts.len() as u16;
+        verts.push((gx, gy, water_level));
+        vert_index.insert((r, c), idx);
+        idx
+    };
+
+    // Same CCW-from-above winding as build_tile_geometry's vidx(r,c) grid:
+    // (r,c)=NW, (r,c+1)=NE, (r+1,c)=SW, (r+1,c+1)=SE.
+    let mut tris: Vec<LodTriangle> = Vec::new();
+    for r in 0..n {
+        for c in 0..n {
+            if underwater(r, c) && underwater(r + 1, c) && underwater(r, c + 1) && underwater(r + 1, c + 1) {
+                let nw = get_vert(r, c);
+                let ne = get_vert(r, c + 1);
+                let sw = get_vert(r + 1, c);
+                let se = get_vert(r + 1, c + 1);
+                tris.push((nw, se, ne));
+                tris.push((nw, sw, se));
+            }
+        }
+    }
+
+    if tris.is_empty() {
+        None
+    } else {
+        Some((verts, tris))
+    }
+}
+
 /// Margin (game units) the global skirt floor sits below the worldspace's
 /// own lowest possible terrain point. Still not derived from real data (real
 /// xLODGen's own floor, -14098, is presumably tied to its internal defaults
@@ -628,8 +733,13 @@ fn ni_av_object_fields(buf: &mut Vec<u8>, properties: &[u32], translation: (f32,
 }
 
 /// `BSMultiBoundNode` (extends `NiNode` extends `NiAVObject`): the root node
-/// of the tile, with the terrain `NiTriShape` as its one child and a
-/// `BSMultiBound` bounding-volume reference.
+/// of the tile, with the terrain `NiTriShape` (and, when present, the
+/// stub/water `BSSegmentedTriShape`s) as children, plus a `BSMultiBound`
+/// bounding-volume reference. `children` lists every child block index —
+/// confirmed against real files: a tile with water/stub shapes has a
+/// `BSMultiBoundNode` exactly 8 bytes (2 extra `i32` child indices) larger
+/// than a land-only tile's, with the extra entries being those shapes'
+/// block indices.
 ///
 /// `translation` places the whole tile in world space: `(tile_cell_x,
 /// tile_cell_y) * CELL_GAME_UNITS`. Real xLODGen tiles always bake
@@ -647,13 +757,15 @@ fn ni_av_object_fields(buf: &mut Vec<u8>, properties: &[u32], translation: (f32,
 /// real tiles keep translation.z=0 and bake absolute Z directly into each
 /// vertex, since height varies per-vertex rather than being a per-tile
 /// constant offset.
-fn build_bs_multi_bound_node(child_tri_shape_idx: u32, multi_bound_idx: u32, translation: (f32, f32, f32)) -> Vec<u8> {
+fn build_bs_multi_bound_node(children: &[u32], multi_bound_idx: u32, translation: (f32, f32, f32)) -> Vec<u8> {
     let mut buf = Vec::new();
     ni_object_net_prefix(&mut buf, -1);
     ni_av_object_fields(&mut buf, &[], translation, 2062); // flags: real value, not the generic NiAVObject default
     // NiNode: children list
-    pu32(&mut buf, 1);
-    pi32(&mut buf, child_tri_shape_idx as i32);
+    pu32(&mut buf, children.len() as u32);
+    for &c in children {
+        pi32(&mut buf, c as i32);
+    }
     // numEffects (present: userVersion2 < 130)
     pu32(&mut buf, 0);
     // BSMultiBoundNode: multiBound (userVersion < 12, so no cullMode field)
@@ -675,6 +787,52 @@ fn build_ni_tri_shape(shader_property_idx: u32, data_idx: u32) -> Vec<u8> {
     pu32(&mut buf, 0); // numMaterials
     pi32(&mut buf, 0); // activeMaterial
     pbool(&mut buf, false); // dirtyFlag
+    buf
+}
+
+/// `BSSegmentedTriShape` (extends `NiTriShape`, which extends `NiTriBasedGeom`
+/// extends `NiGeometry` extends `NiAVObject`): identical to `NiTriShape`
+/// except for a trailing `numSegments`/`segments[]` array. Used by real tiles
+/// for two purposes we've confirmed by decoding real reference files: an
+/// always-present, always-degenerate "stub" (1 vertex at the origin, 1
+/// degenerate triangle, 3 empty segments, `translation=(0,0,0)`) and, when
+/// the tile actually has water, a real water plane. Neither carries a
+/// `properties` list — no shader/texture is attached to either (confirmed:
+/// both real blocks have `numProperties=0`), which is also why their
+/// `NiTriShapeData` always has `numUVSets=0` and `additionalData=-1`
+/// (see `build_ni_tri_shape_data`).
+///
+/// `translation` for the water shape is NOT `(0,0,0)` like the main
+/// `NiTriShape` — it's `(tile_cell_x, tile_cell_y) * CELL_GAME_UNITS`, the
+/// exact same value as the parent `BSMultiBoundNode`'s own translation,
+/// confirmed identically across 15 real tiles at different positions. That
+/// means the water shape's absolute position isn't reached by composing
+/// through the normal parent-child transform (which would double it) —
+/// water appears to be read by a separate subsystem that takes this child's
+/// translation as-is, not through the scene graph hierarchy.
+///
+/// `segments` here is deliberately simplified versus real files (which
+/// subdivide into many small per-quad segments for reasons we don't fully
+/// understand — possibly just an xLODGen-internal batching optimization,
+/// not something the engine requires, since our main terrain shape works
+/// fine with none at all): we write exactly one segment spanning every
+/// triangle. Easy to replace with real per-quad segmentation later if
+/// testing shows it's needed.
+fn build_bs_segmented_tri_shape(data_idx: u32, translation: (f32, f32, f32), num_triangles: u32) -> Vec<u8> {
+    let mut buf = Vec::new();
+    ni_object_net_prefix(&mut buf, -1); // no name, matches both real blocks
+    ni_av_object_fields(&mut buf, &[], translation, 14); // no properties: no shader attached
+    pi32(&mut buf, data_idx as i32); // data -> NiTriShapeData
+    pi32(&mut buf, -1); // skinInstance (none)
+    pu32(&mut buf, 0); // numMaterials
+    pi32(&mut buf, 0); // activeMaterial
+    pbool(&mut buf, false); // dirtyFlag
+    // BSSegmentedTriShape: numSegments + segments[] (unknownByte1: u8,
+    // startTriangle: u32, numTriangles: u32 each — 9 bytes/segment).
+    pu32(&mut buf, 1); // numSegments
+    buf.push(0); // unknownByte1
+    pu32(&mut buf, 0); // startTriangle
+    pu32(&mut buf, num_triangles); // numTriangles
     buf
 }
 
@@ -767,9 +925,16 @@ fn build_ni_additional_geometry_data(verts: &[LodVertex]) -> Vec<u8> {
 
 /// `NiTriShapeData` (extends `NiTriBasedGeomData` extends `NiGeometryData`
 /// extends `NiObject` directly). `additional_data_idx` references the
-/// sibling `NiAdditionalGeometryData` block (see its doc comment) — every
-/// real reference tile has this set, matching `userVersion == 11`
+/// sibling `NiAdditionalGeometryData` block, or `-1` for none — real terrain
+/// shapes (with a texture attached) always have this set; the water and
+/// stub `BSSegmentedTriShape` data blocks (no texture attached) always have
+/// `-1` (confirmed by decoding both), matching `userVersion == 11`
 /// (skyrimMaterial field is version==12-only, so absent here).
+///
+/// `has_uv` mirrors whether a texture set is attached: real terrain shapes
+/// have `numUVSets=1` plus a full UV array; the water/stub shapes (no
+/// shader/texture property at all) have `numUVSets=0` and no UV array,
+/// confirmed by decoding both real reference blocks directly.
 ///
 /// `top_surface_count` is how many of `verts`' leading entries are the
 /// actual top surface, with the rest being skirt geometry — the bounding
@@ -777,12 +942,14 @@ fn build_ni_additional_geometry_data(verts: &[LodVertex]) -> Vec<u8> {
 /// tiles exactly (decoded directly: a real tile's center.z and radius match
 /// its top surface's own Z range precisely, excluding the skirt entirely,
 /// which hangs an arbitrary/unverified depth below and would otherwise
-/// wildly inflate the radius and drag the center down).
+/// wildly inflate the radius and drag the center down). Pass `verts.len()`
+/// for shapes with no skirt (water, stub).
 fn build_ni_tri_shape_data(
     verts: &[LodVertex],
     tris: &[LodTriangle],
-    additional_data_idx: u32,
+    additional_data_idx: i32,
     top_surface_count: usize,
+    has_uv: bool,
 ) -> Vec<u8> {
     let mut buf = Vec::new();
     let (mut min_x, mut min_y, mut min_z) = (f32::MAX, f32::MAX, f32::MAX);
@@ -822,14 +989,13 @@ fn build_ni_tri_shape_data(
         pf32(&mut buf, y);
         pf32(&mut buf, z);
     }
-    buf.push(1); // numUVSets = 1 — required: this shape has an assigned
-                 // diffuse/normal texture set (BSShaderTextureSet), and a
-                 // textured mesh with zero UV data is invalid. An earlier
-                 // version of this generator shipped numUVSets=0 here,
-                 // which is almost certainly what caused the "sunken
-                 // terrain" rendering and the load hang on a larger
-                 // worldspace reported during testing — every real
-                 // GECK/xLODGen-generated tile has numUVSets=1.
+    // numUVSets: 1 for a texture-carrying shape (required — a textured mesh
+    // with zero UV data is invalid; an earlier version of this generator
+    // shipped numUVSets=0 unconditionally, which is almost certainly what
+    // caused the "sunken terrain" rendering and a load hang), 0 for a shape
+    // with no shader/texture property at all (water, stub — confirmed by
+    // decoding both real reference blocks directly).
+    buf.push(if has_uv { 1 } else { 0 });
     buf.push(0); // extraVectorFlags
     pbool(&mut buf, false); // hasNormals
     pf32(&mut buf, center.0);
@@ -837,22 +1003,25 @@ fn build_ni_tri_shape_data(
     pf32(&mut buf, center.2);
     pf32(&mut buf, radius);
     pbool(&mut buf, false); // hasVertexColors
-    // numUVSets & 1 == 1: one planar UV coordinate per vertex, mapping the
-    // tile's own world-space extent onto the single 256x256 diffuse/normal
-    // atlas baked for this tile. u decreases west->east, v increases
-    // south->north, matching bake_tile_textures's px=0->east/py=0->south
-    // raster and real xLODGen's own UV convention exactly (re-derived from
-    // a real tile's corner UVs: NW->(1,1), NE->(0,1), SW->(1,0), SE->(0,0)).
-    let span_x = (max_x - min_x).max(1e-6);
-    let span_y = (max_y - min_y).max(1e-6);
-    for &(x, y, _z) in verts {
-        let u = (max_x - x) / span_x;
-        let v = (y - min_y) / span_y;
-        pf32(&mut buf, u);
-        pf32(&mut buf, v);
+    if has_uv {
+        // One planar UV coordinate per vertex, mapping the tile's own
+        // world-space extent onto the single 256x256 diffuse/normal atlas
+        // baked for this tile. u decreases west->east, v increases
+        // south->north, matching bake_tile_textures's px=0->east/py=0->south
+        // raster and real xLODGen's own UV convention exactly (re-derived
+        // from a real tile's corner UVs: NW->(1,1), NE->(0,1), SW->(1,0),
+        // SE->(0,0)).
+        let span_x = (max_x - min_x).max(1e-6);
+        let span_y = (max_y - min_y).max(1e-6);
+        for &(x, y, _z) in verts {
+            let u = (max_x - x) / span_x;
+            let v = (y - min_y) / span_y;
+            pf32(&mut buf, u);
+            pf32(&mut buf, v);
+        }
     }
     pu16(&mut buf, 0); // consistencyFlags
-    pi32(&mut buf, additional_data_idx as i32); // additionalData -> NiAdditionalGeometryData
+    pi32(&mut buf, additional_data_idx); // additionalData -> NiAdditionalGeometryData, or -1
     // NiTriBasedGeomData:
     pu16(&mut buf, tris.len() as u16); // numTriangles
     // NiTriShapeData:
@@ -917,38 +1086,68 @@ fn build_bs_multi_bound_aabb(verts: &[LodVertex]) -> Vec<u8> {
 /// `verts` — skirt vertices excluded), matching `NiTriShapeData`'s own
 /// center/radius fix for the same reason (see `build_ni_tri_shape_data`'s
 /// doc comment).
+///
+/// `water`, when present, is absolute-world-space vertices/triangles (same
+/// contract as `verts`/`tris` — see `build_water_geometry`) for the tile's
+/// water plane. When `Some`, two extra `BSSegmentedTriShape` children are
+/// added to the root node: an always-present degenerate stub (matching
+/// every real reference tile, water or not) and the real water shape —
+/// see `build_bs_segmented_tri_shape`'s doc comment for why neither has a
+/// shader/texture property and why the water shape's translation differs
+/// from the main terrain shape's. When `None`, neither block is written at
+/// all, matching real land-only tiles exactly (not a degenerate pair).
 pub fn build_lod_nif(
     verts: &[LodVertex],
     tris: &[LodTriangle],
     diffuse_path: &str,
     normal_path: &str,
     tile_origin: (f32, f32),
+    water: Option<(&[LodVertex], &[LodTriangle])>,
 ) -> Vec<u8> {
     let top_surface_count = ((LOD_TILE_QUADS + 1) * (LOD_TILE_QUADS + 1)).min(verts.len());
     let aabb_verts: Vec<LodVertex> = verts[..top_surface_count].to_vec();
 
-    let local_verts: Vec<LodVertex> = verts
-        .iter()
-        .map(|&(x, y, z)| (x - tile_origin.0, y - tile_origin.1, z))
-        .collect();
+    let to_local = |v: &[LodVertex]| -> Vec<LodVertex> {
+        v.iter()
+            .map(|&(x, y, z)| (x - tile_origin.0, y - tile_origin.1, z))
+            .collect()
+    };
+
+    let local_verts: Vec<LodVertex> = to_local(verts);
     let verts = &local_verts[..];
+
+    let local_water: Option<(Vec<LodVertex>, &[LodTriangle])> =
+        water.map(|(wv, wt)| (to_local(wv), wt));
 
     // Fixed block order; indices below are hand-resolved to match (no
     // generic block-reference remapping needed since we build the block
-    // list directly in final order).
+    // list directly in final order). When water is present, 4 extra blocks
+    // (stub shape+data, water shape+data) are inserted right after
+    // NiAdditionalGeometryData, matching real files' order exactly, so
+    // BSMultiBound/BSMultiBoundAABB shift from 6/7 to 10/11.
     const IDX_ROOT: u32 = 0; // BSMultiBoundNode, the scene graph's root
     const IDX_TRI_SHAPE: u32 = 1;
     const IDX_SHADER_PROPERTY: u32 = 2;
     const IDX_TEXTURE_SET: u32 = 3;
     const IDX_TRI_SHAPE_DATA: u32 = 4;
     const IDX_ADDITIONAL_GEOMETRY_DATA: u32 = 5;
-    const IDX_MULTI_BOUND: u32 = 6;
-    const IDX_MULTI_BOUND_AABB: u32 = 7;
+    const IDX_STUB_SHAPE: u32 = 6;
+    const IDX_STUB_DATA: u32 = 7;
+    const IDX_WATER_SHAPE: u32 = 8;
+    const IDX_WATER_DATA: u32 = 9;
+    let idx_multi_bound: u32 = if local_water.is_some() { 10 } else { 6 };
+    let idx_multi_bound_aabb: u32 = if local_water.is_some() { 11 } else { 7 };
 
-    let blocks: Vec<(&'static str, Vec<u8>)> = vec![
+    let children: Vec<u32> = if local_water.is_some() {
+        vec![IDX_TRI_SHAPE, IDX_STUB_SHAPE, IDX_WATER_SHAPE]
+    } else {
+        vec![IDX_TRI_SHAPE]
+    };
+
+    let mut blocks: Vec<(&'static str, Vec<u8>)> = vec![
         (
             "BSMultiBoundNode",
-            build_bs_multi_bound_node(IDX_TRI_SHAPE, IDX_MULTI_BOUND, (tile_origin.0, tile_origin.1, 0.0)),
+            build_bs_multi_bound_node(&children, idx_multi_bound, (tile_origin.0, tile_origin.1, 0.0)),
         ),
         (
             "NiTriShape",
@@ -964,15 +1163,39 @@ pub fn build_lod_nif(
         ),
         (
             "NiTriShapeData",
-            build_ni_tri_shape_data(verts, tris, IDX_ADDITIONAL_GEOMETRY_DATA, top_surface_count),
+            build_ni_tri_shape_data(verts, tris, IDX_ADDITIONAL_GEOMETRY_DATA as i32, top_surface_count, true),
         ),
         (
             "NiAdditionalGeometryData",
             build_ni_additional_geometry_data(verts),
         ),
-        ("BSMultiBound", build_bs_multi_bound(IDX_MULTI_BOUND_AABB)),
-        ("BSMultiBoundAABB", build_bs_multi_bound_aabb(&aabb_verts)),
     ];
+
+    if let Some((water_verts, water_tris)) = &local_water {
+        // Stub: always-present, always-degenerate second child, matching
+        // every real reference tile regardless of whether it has water.
+        blocks.push((
+            "BSSegmentedTriShape",
+            build_bs_segmented_tri_shape(IDX_STUB_DATA, (0.0, 0.0, 0.0), 0),
+        ));
+        blocks.push((
+            "NiTriShapeData",
+            build_ni_tri_shape_data(&[(0.0, 0.0, 0.0)], &[(0, 0, 0)], -1, 1, false),
+        ));
+        // Water: translation duplicates the parent node's own translation
+        // (tile_origin), not (0,0,0) — see build_bs_segmented_tri_shape.
+        blocks.push((
+            "BSSegmentedTriShape",
+            build_bs_segmented_tri_shape(IDX_WATER_DATA, (tile_origin.0, tile_origin.1, 0.0), water_tris.len() as u32),
+        ));
+        blocks.push((
+            "NiTriShapeData",
+            build_ni_tri_shape_data(water_verts, water_tris, -1, water_verts.len(), false),
+        ));
+    }
+
+    blocks.push(("BSMultiBound", build_bs_multi_bound(idx_multi_bound_aabb)));
+    blocks.push(("BSMultiBoundAABB", build_bs_multi_bound_aabb(&aabb_verts)));
 
     // --- header ---
     let mut header = Vec::new();
@@ -1132,9 +1355,52 @@ mod tests {
             "Data\\Textures\\Landscape\\LOD\\ArnisWorldspace\\Diffuse\\ArnisWorldspace.n.Level4.X0.Y0.dds",
             "Data\\Textures\\Landscape\\LOD\\ArnisWorldspace\\Normals\\ArnisWorldspace.n.Level4.X0.Y0.dds",
             (0.0, 0.0),
+            None,
         );
         let out_path = std::env::var("ARNIS_TEST_NIF_OUT")
             .unwrap_or_else(|_| "test_sample.nif".to_string());
+        std::fs::write(&out_path, &nif).expect("failed to write test NIF");
+        println!("wrote {} bytes to {}", nif.len(), out_path);
+    }
+
+    /// Same synthetic tile as `write_sample_nif_for_inspection`, but with a
+    /// water plane covering half of it — structurally verifies the water
+    /// path (12 blocks including both `BSSegmentedTriShape`s, correct
+    /// `BSMultiBoundNode` children count) without needing a full worldspace
+    /// generation run.
+    #[test]
+    fn write_sample_nif_with_water_for_inspection() {
+        let mut verts = Vec::new();
+        for row in 0..3 {
+            for col in 0..3 {
+                verts.push((col as f32 * 512.0, row as f32 * 512.0, 100.0 + row as f32 * 10.0));
+            }
+        }
+        let vidx = |r: u16, c: u16| -> u16 { r * 3 + c };
+        let mut tris = Vec::new();
+        for r in 0..2u16 {
+            for c in 0..2u16 {
+                tris.push((vidx(r, c), vidx(r, c + 1), vidx(r + 1, c + 1)));
+                tris.push((vidx(r, c), vidx(r + 1, c + 1), vidx(r + 1, c)));
+            }
+        }
+        let water_verts = vec![
+            (0.0, 0.0, 50.0),
+            (512.0, 0.0, 50.0),
+            (0.0, 512.0, 50.0),
+            (512.0, 512.0, 50.0),
+        ];
+        let water_tris = vec![(0u16, 3u16, 1u16), (0u16, 2u16, 3u16)];
+        let nif = build_lod_nif(
+            &verts,
+            &tris,
+            "Data\\Textures\\Landscape\\LOD\\ArnisWorldspace\\Diffuse\\ArnisWorldspace.n.Level4.X0.Y0.dds",
+            "Data\\Textures\\Landscape\\LOD\\ArnisWorldspace\\Normals\\ArnisWorldspace.n.Level4.X0.Y0.dds",
+            (0.0, 0.0),
+            Some((&water_verts, &water_tris)),
+        );
+        let out_path = std::env::var("ARNIS_TEST_NIF_WATER_OUT")
+            .unwrap_or_else(|_| "test_sample_water.nif".to_string());
         std::fs::write(&out_path, &nif).expect("failed to write test NIF");
         println!("wrote {} bytes to {}", nif.len(), out_path);
     }

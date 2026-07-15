@@ -2521,15 +2521,28 @@ pub fn generate_fnv_esm(
         })
         .collect();
 
-    // Group cells into exterior blocks (div_euclid 8) and subblocks (div_euclid 2).
-
+    // Group cells into exterior blocks (div_euclid 16) and subblocks (div_euclid 8).
+    //
+    // Confirmed empirically (2026-07-14) by diffing our raw output against the
+    // same file after GECK opened+resaved it: GECK regrouped the identical 384
+    // CELL records from our 8 blocks / 96 subblocks down to 4 blocks / 8
+    // subblocks. Reverse-engineering each cell's (cell_x, cell_y) against its
+    // containing block/subblock label in the GECK-resaved file showed block
+    // membership is constant in runs of 16 consecutive cell coordinates and
+    // subblock membership in runs of 8 — i.e. block size is 16 cells/side and
+    // subblock size is 8 cells/side, not 8/2 as previously assumed (that 8/2
+    // pairing is the *interior*-cell convention, not the exterior worldspace
+    // one). Using the wrong (too-fine) bucket sizes fragmented the runtime
+    // streaming hierarchy the engine walks, which is why only the starting
+    // 3x3 cells around the player ever loaded in-game despite GECK itself
+    // rendering the (uncorrected) file fine.
     #[allow(clippy::type_complexity)]
     let mut blocks: BTreeMap<(i32, i32), BTreeMap<(i32, i32), Vec<usize>>> = BTreeMap::new();
     for (idx, cell) in cells.iter().enumerate() {
-        let bx = cell.cell_x.div_euclid(8);
-        let by = cell.cell_y.div_euclid(8);
-        let sx = cell.cell_x.div_euclid(2);
-        let sy = cell.cell_y.div_euclid(2);
+        let bx = cell.cell_x.div_euclid(16);
+        let by = cell.cell_y.div_euclid(16);
+        let sx = cell.cell_x.div_euclid(8);
+        let sy = cell.cell_y.div_euclid(8);
         blocks
             .entry((bx, by))
             .or_default()
@@ -2550,8 +2563,14 @@ pub fn generate_fnv_esm(
             for &idx in cell_indices {
                 let cell = &cells[idx];
 
+                // "arnis", not "arnisWorldspace" — the latter collides
+                // (case-insensitively) with the WRLD record's own EDID
+                // ("ArnisWorldspace"), which GECK flags as a duplicate. A
+                // real, plausible cause of the observed cell-streaming bug
+                // if the engine's name-based lookup gets confused between
+                // the worldspace and this cell sharing an EDID.
                 let coc_edid = if cell.cell_x == 0 && cell.cell_y == 0 {
-                    Some("arnisWorldspace")
+                    Some("arnis")
                 } else {
                     None
                 };
@@ -2613,11 +2632,21 @@ pub fn generate_fnv_esm(
             }
 
             // FNV exterior subblock GRUP label: Y-coordinate first, then X (LE i16 pairs).
+            //
+            // REVERTED (2026-07-XX): briefly flipped this to X-then-Y based on a
+            // bisection that pointed at commit 9b2fcd1, which introduced this
+            // Y-then-X order. That revert produced a *different* wrong pattern
+            // (tiles loading in a "kitty-corner" 2-of-4 checkerboard rather than
+            // the original shelf), so X-then-Y is not simply correct either —
+            // reverted back to Y-then-X pending further investigation (comparing
+            // against a GECK-resaved .esm to see what GECK itself normalizes).
             let sub_label = xy_label(*sy as i16, *sx as i16);
             push_grup(&mut block_content, sub_label, 5, &subblock_content);
         }
 
         // FNV exterior block GRUP label: Y-coordinate first, then X (LE i16 pairs).
+        // See the subblock label comment above — reverted pending further
+        // investigation.
         let blk_label = xy_label(*by as i16, *bx as i16);
         push_grup(&mut world_children_content, blk_label, 4, &block_content);
     }
@@ -2760,6 +2789,7 @@ pub fn generate_fnv_esm(
         num_rows as i32,
         global_min,
         effective_scale,
+        effective_water_level,
     );
     for (relative_path, bytes) in &lod_assets {
         let path = resolved_dir.join(relative_path.replace('/', std::path::MAIN_SEPARATOR_STR));
